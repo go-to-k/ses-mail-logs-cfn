@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: SES Log
+
+Metadata:
+  "AWS::CloudFormation::Interface":
+    ParameterGroups:
+      - Label:
+          default: "ConfigurationSetArn"
+        Parameters:
+          - ConfigurationSetArn
+      - Label:
+          default: "Kinesis Firehose"
+        Parameters:
+          - SizeInMBs
+          - IntervalInSeconds
+          - CompressionFormat
+      - Label:
+          default: "S3"
+        Parameters:
+          - SesLogsBucketName
+          - ExpirationInDays
+
+# ------------------------------------------------------------#
+# Input Parameters
+# ------------------------------------------------------------#
+Parameters:
+  ConfigurationSetArn:
+    Type: String
+
+  SesLogsBucketName:
+    Description: "A name for logs bucket. "
+    Type: String
+
+  ExpirationInDays:
+    Description: "Indicates the number of days after creation when objects are deleted from Amazon S3"
+    Type: Number
+    Default: 90
+
+  SizeInMBs:
+    Description: "The size of the buffer, in MBs, that Kinesis Data Firehose uses for incoming data before delivering it to the destination."
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 128
+
+  IntervalInSeconds:
+    Description: The length of time, in seconds, that Kinesis Data Firehose buffers incoming data before delivering it to the destination.
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+
+  CompressionFormat:
+    Description: "The type of compression that Kinesis Data Firehose uses to compress the data that it delivers to the Amazon S3 bucket. "
+    Type: String
+    Default: "ZIP"
+    AllowedValues: ["GZIP", "Snappy", "UNCOMPRESSED", "ZIP"]
+
+Resources:
+  # ------------------------------------------------------------#
+  # IAM Role for SES to Kinesis
+  # ------------------------------------------------------------#
+  SesLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-SesLogRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+                AWS:SourceArn: !Ref ConfigurationSetArn
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - firehose:PutRecordBatch
+                Effect: Allow
+                Resource: !GetAtt SesLogDeliveryStream.Arn
+          PolicyName: ses_log_role_policy
+
+  # ------------------------------------------------------------#
+  # SES Logging
+  # ------------------------------------------------------------#
+  SesLogsS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref SesLogsBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: !Sub "ExpirationIn-${ExpirationInDays}Days"
+            ExpirationInDays: !Ref "ExpirationInDays"
+            Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      VersioningConfiguration:
+        Status: Enabled
+
+  SesLogsS3BucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket:
+        Ref: SesLogsS3Bucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - "s3:AbortMultipartUpload"
+              - "s3:GetBucketLocation"
+              - "s3:GetObject"
+              - "s3:ListBucket"
+              - "s3:ListBucketMultipartUploads"
+              - "s3:PutObject"
+              - "s3:PutObjectAcl"
+            Effect: Allow
+            Resource:
+              - "Fn::Join":
+                  - ""
+                  - - "arn:aws:s3:::"
+                    - Ref: SesLogsS3Bucket
+                    - /*
+              - "Fn::Join":
+                  - ""
+                  - - "arn:aws:s3:::"
+                    - Ref: SesLogsS3Bucket
+            Principal:
+              AWS: !Sub "${SesLogFirehoseRole.Arn}"
+
+  SesLogDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub "aws-ses-logs-${AWS::StackName}"
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !Sub "${SesLogsS3Bucket.Arn}"
+        BufferingHints:
+          SizeInMBs: !Ref SizeInMBs
+          IntervalInSeconds: !Ref IntervalInSeconds
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub "/aws/kinesisfirehose/aws-ses-logs-${AWS::StackName}"
+          LogStreamName: S3Delivery
+        CompressionFormat: !Ref CompressionFormat
+        EncryptionConfiguration:
+          NoEncryptionConfig: NoEncryption
+        ErrorOutputPrefix: "ses-logs-error-"
+        Prefix: "ses-logs-"
+        RoleARN: !Sub "${SesLogFirehoseRole.Arn}"
+
+  SesLogDeliveryStreamLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/kinesisfirehose/aws-ses-logs-${AWS::StackName}"
+      RetentionInDays: 400
+
+  SesLogDeliveryStreamLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref SesLogDeliveryStreamLogGroup
+      LogStreamName: S3Delivery
+
+  SesLogFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-SesLogFirehoseRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - glue:GetTable
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                Effect: Allow
+                Resource: "*"
+              - Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Effect: Allow
+                Resource:
+                  - !Sub "${SesLogsS3Bucket.Arn}"
+                  - !Sub "${SesLogsS3Bucket.Arn}/*"
+                  - arn:aws:s3:::%FIREHOSE_BUCKET_NAME%
+                  - arn:aws:s3:::%FIREHOSE_BUCKET_NAME%/*
+              - Action: kms:Decrypt
+                Effect: Allow
+                Resource: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/%SSE_KEY_ID%"
+              - Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Effect: Allow
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:%FIREHOSE_DEFAULT_FUNCTION%:%FIREHOSE_DEFAULT_VERSION%"
+              - Action: logs:PutLogEvents
+                Effect: Allow
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/aws-ses-logs-${AWS::StackName}:log-stream:*"
+              - Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                Effect: Allow
+                Resource: !Sub "arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/%FIREHOSE_STREAM_NAME%"
+          PolicyName: firehose_delivery_role_policy
+
+# ------------------------------------------------------------#
+# Output Parameters
+# ------------------------------------------------------------#
+Outputs:
+  SesLogDeliveryStreamArn:
+    Value: !GetAtt SesLogDeliveryStream.Arn
+    Export:
+      Name: !Sub "SesLogDeliveryStream-Arn-${AWS::StackName}"
+
+  SesLogRoleArn:
+    Value: !GetAtt SesLogRole.Arn
+    Export:
+      Name: !Sub "SesLogRole-Arn-${AWS::StackName}"
